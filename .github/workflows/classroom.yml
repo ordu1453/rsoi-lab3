@@ -3,9 +3,13 @@ on:
   push:
     branches:
       - master
+      - deve
+      - dev
   pull_request:
     branches:
       - master
+      - deve
+      - dev
 jobs:
   build:
     name: Autograding
