@@ -5,7 +5,35 @@ from flask import Flask, jsonify, request
 from datetime import datetime
 import threading
 import time
-from threading import Lock
+from threading import Lock, Thread
+from queue import Queue
+
+# Очередь для отложенного обновления рейтинга
+rating_queue = Queue()
+
+def process_rating_queue():
+    while True:
+        try:
+            username, increment = rating_queue.get()
+            try:
+                resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": username}, timeout=2)
+                if resp.status_code == 200:
+                    current_stars = resp.json().get("stars", 1)
+                    requests.post(f"{RATING_URL}/rating", json={"username": username, "stars": current_stars + increment})
+                else:
+                    # Если не удалось, возвращаем в очередь
+                    rating_queue.put((username, increment))
+            except requests.RequestException:
+                rating_queue.put((username, increment))
+        except Exception:
+            pass
+        time.sleep(1)  # небольшой интервал между попытками
+
+# Запускаем поток для обработки очереди
+Thread(target=process_rating_queue, daemon=True).start()
+
+def enqueue_rating_update(username, increment):
+    rating_queue.put((username, increment))
 
 # ----------------- Redis -----------------
 r = redis.Redis(host='redis', port=6379, db=0) 
@@ -195,7 +223,6 @@ def get_reservations():
 
 
 # -------------------- Создание бронирования --------------------
-# ----------------- Create Reservation -----------------
 @app.route("/api/v1/reservations", methods=["POST"])
 def create_reservation():
     user_name = request.headers.get("X-User-Name")
@@ -205,67 +232,44 @@ def create_reservation():
     till_date = data.get("tillDate")
 
     # Проверка лимита по количеству книг
-    rented_count = 0
-    try:
-        rented_resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}/count")
-        if rented_resp.status_code == 200:
-            rented_count = rented_resp.json().get("rentedCount", 0)
-    except requests.RequestException:
-        pass
+    rented_resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}/count")
+    rented_count = rented_resp.json().get("rentedCount", 0) if rented_resp.status_code == 200 else 0
 
-    stars = 1
+    # Получаем текущий рейтинг через Circuit Breaker
     try:
         rating_resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
         rating_resp.raise_for_status()
         stars = rating_resp.json().get("stars", 1)
     except requests.RequestException:
-        # сервис недоступен — используем fallback
-        stars = 1
+        stars = 1  # fallback если сервис недоступен
 
     if rented_count >= stars:
         return jsonify({"message": "Maximum number of rented books reached"}), 400
 
     # Получаем информацию о книге и библиотеке
-    book_data = {}
-    library_data = {}
-    try:
-        book_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/{book_uid}")
-        if book_resp.status_code == 200:
-            book_data = book_resp.json()
-    except requests.RequestException:
-        pass
-
-    try:
-        library_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}")
-        if library_resp.status_code == 200:
-            library_data = library_resp.json()
-    except requests.RequestException:
-        pass
+    book_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/{book_uid}")
+    library_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}")
+    book_data = book_resp.json() if book_resp.status_code == 200 else {}
+    library_data = library_resp.json() if library_resp.status_code == 200 else {}
 
     # Создаём запись в Reservation Service
     payload = {"bookUid": book_uid, "libraryUid": library_uid, "tillDate": till_date}
     headers = {"X-User-Name": user_name, "Content-Type": "application/json"}
-    try:
-        res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers, timeout=2)
-        reservation_json = res.json() if res.status_code == 200 else {}
-    except requests.RequestException:
-        reservation_json = {}
+    res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers)
+    reservation_json = res.json()
 
     # Уменьшаем доступные книги
-    try:
-        requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement")
-    except requests.RequestException:
-        pass
+    requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement")
 
-    # Обновляем рейтинг через очередь
+    # Обновляем рейтинг пользователя
     try:
-        # если сервис доступен — обновляем сразу
+        # Если сервис доступен — обновляем сразу
         resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
         resp.raise_for_status()
         current_stars = resp.json().get("stars", 1)
         requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": current_stars + 1})
     except requests.RequestException:
-        # если недоступен — добавляем в очередь
+        # если сервис недоступен — добавляем в очередь
         enqueue_rating_update(user_name, 1)
 
     response = {
@@ -299,29 +303,29 @@ def return_book(reservation_uid):
     returned_date = datetime.strptime(returned_date_str, "%Y-%m-%d").date()
 
     headers = {"X-User-Name": user_name}
-    try:
-        resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers, timeout=2)
-        if resp.status_code != 200:
-            return jsonify({"message": "Reservation not found"}), resp.status_code
-        reservation = resp.json()
-    except requests.RequestException:
-        return jsonify({"message": "Reservation Service unavailable"}), 503
+    resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers)
 
+    if resp.status_code == 404:
+        return jsonify({"message": "Reservation not found"}), 404
+    elif resp.status_code != 200:
+        return jsonify({"message": "Failed to fetch reservation"}), resp.status_code
+
+    reservation = resp.json()
     till_date = datetime.strptime(reservation["tillDate"], "%Y-%m-%d").date()
+
+    # Определяем новый статус
     status = "RETURNED"
+    penalty = 0
     if returned_date > till_date:
         status = "EXPIRED"
+        penalty += 1  # штраф за просрочку
 
+    # Обновляем Reservation Service
     payload = {"condition": returned_condition, "date": returned_date_str}
-    try:
-        requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", json=payload, headers=headers)
-    except requests.RequestException:
-        pass
+    requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", json=payload, headers=headers)
 
-    # обновляем рейтинг через очередь
-    penalty = 10 if status == "EXPIRED" else 0
-    total_increment = 1 + penalty
-
+    # Обновляем рейтинг
+    total_increment = 1 + penalty  # всегда +1 за возврат + штраф, если просрочка
     try:
         resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
         resp.raise_for_status()
