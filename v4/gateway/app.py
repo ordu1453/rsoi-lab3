@@ -4,6 +4,7 @@ from datetime import datetime
 import time
 from threading import Lock
 
+
 class CircuitBreaker:
     def __init__(self, failure_threshold=3, retry_timeout=10):
         self.failure_threshold = failure_threshold
