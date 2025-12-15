@@ -15,6 +15,12 @@ services:
       - "5432:5432"
 
 # TODO добавить сервисы
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
   gateway:
     build: ./v4/gateway
     container_name: gateway_service
