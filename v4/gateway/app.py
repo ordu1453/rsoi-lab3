@@ -177,12 +177,12 @@ def create_reservation():
     rented_count = rented_resp.json().get("rentedCount", 0) if rented_resp.status_code == 200 else 0
 
     # Получаем рейтинг пользователя через Circuit Breaker
-    try:
-        stars_resp = rating_cb.call(fetch_rating, user_name)
-        stars = stars_resp.get("stars", 1)
-    except Exception:
-        # Если rating_service упал, даём дефолтное значение
-        stars = 1
+    stars_resp = rating_cb.call(fetch_rating, user_name)
+    if "message" in stars_resp:
+        # fallback сработал → зависимый сервис недоступен
+        return jsonify(stars_resp), 503
+
+    stars = stars_resp.get("stars", 1)
 
     if rented_count >= stars:
         return jsonify({"message": "Maximum number of rented books reached"}), 400
@@ -202,14 +202,13 @@ def create_reservation():
         res.raise_for_status()
         reservation_json = res.json()
     except requests.RequestException:
-        # Если Reservation Service недоступен, возвращаем fallback
         return jsonify({"message": "Reservation Service unavailable"}), 503
 
-    # Уменьшаем доступные книги (не критично для failover)
+    # Уменьшаем доступные книги
     try:
         requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement", timeout=2)
     except:
-        pass  # игнорируем ошибки тут
+        pass
 
     response = {
         "reservationUid": reservation_json.get("reservationUid"),
@@ -232,7 +231,6 @@ def create_reservation():
     }
 
     return jsonify(response), 200
-
 # -------------------- Возврат книги --------------------
 @app.route("/api/v1/reservations/<reservation_uid>/return", methods=["POST"])
 def return_book(reservation_uid):
