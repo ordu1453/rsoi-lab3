@@ -5,9 +5,10 @@ from flask import Flask, jsonify, request
 from datetime import datetime
 import threading
 import time
+from threading import Lock
 
 # ----------------- Redis -----------------
-r = redis.Redis(host='redis', port=6379, db=0)  # предполагаем, что Redis доступен на контейнере "redis"
+r = redis.Redis(host='redis', port=6379, db=0) 
 
 def enqueue_rating_update(user_name, increment):
     """Добавляем обновление рейтинга в очередь Redis"""
