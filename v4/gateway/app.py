@@ -1,6 +1,48 @@
 from flask import Flask, jsonify, request
 import requests
 from datetime import datetime
+import time
+from threading import Lock
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=3, retry_timeout=10):
+        self.failure_threshold = failure_threshold
+        self.retry_timeout = retry_timeout
+        self.failure_count = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.last_failure_time = None
+        self.lock = Lock()
+
+    def call(self, func, *args, **kwargs):
+        with self.lock:
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.retry_timeout:
+                    self.state = "HALF_OPEN"
+                else:
+                    return self.fallback(*args, **kwargs)
+
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            with self.lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = "OPEN"
+            return self.fallback(*args, **kwargs)
+
+        # Успешный ответ → сброс
+        with self.lock:
+            self.failure_count = 0
+            self.state = "CLOSED"
+        return result
+
+    def fallback(self, *args, **kwargs):
+        return {"message": "Service temporarily unavailable (fallback)"}
+    
+library_cb = CircuitBreaker(failure_threshold=3, retry_timeout=10)
+rating_cb = CircuitBreaker(failure_threshold=3, retry_timeout=10)
+reservation_cb = CircuitBreaker(failure_threshold=3, retry_timeout=10)
 
 app = Flask(__name__)
 
@@ -8,48 +50,30 @@ LIBRARY_URL = "http://library_service:8060"
 RATING_URL = "http://rating_service:8050"
 RESERVATION_URL = "http://reservation_service:8070"
 
-# -------------------- Получение библиотек --------------------
-@app.route("/api/v1/libraries", methods=["GET"])
-def get_libraries():
-    city = request.args.get("city", "Москва")
-    page = request.args.get("page", 1)
-    size = request.args.get("size", 1)
-
+# -------------------- Вспомогательные функции для запросов --------------------
+def fetch_libraries(city, page, size):
     params = {"city": city, "page": page, "size": size}
-    resp = requests.get(f"{LIBRARY_URL}/libraries", params=params)
-    return jsonify(resp.json()), resp.status_code
+    resp = requests.get(f"{LIBRARY_URL}/libraries", params=params, timeout=2)
+    resp.raise_for_status()
+    return resp.json()
 
-# -------------------- Получение книг --------------------
-@app.route("/api/v1/libraries/<library_uid>/books", methods=["GET"])
-def get_books(library_uid):
-    page = request.args.get("page", 1)
-    size = request.args.get("size", 1)
-    show_all = request.args.get("showAll", "false").lower() == "true"
-
+def fetch_books(library_uid, page, size, show_all):
     params = {"page": page, "size": size, "showAll": show_all}
-    resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/books", params=params)
-    return jsonify(resp.json()), resp.status_code
+    resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/books", params=params, timeout=2)
+    resp.raise_for_status()
+    return resp.json()
 
-# -------------------- Получение рейтинга --------------------
-@app.route("/api/v1/rating", methods=["GET"])
-def get_rating():
-    user_name = request.headers.get("X-User-Name")
+def fetch_rating(user_name):
     headers = {"X-User-Name": user_name}
-    resp = requests.get(f"{RATING_URL}/rating", headers=headers)
-    return jsonify(resp.json()), resp.status_code
+    resp = requests.get(f"{RATING_URL}/rating", headers=headers, timeout=2)
+    resp.raise_for_status()
+    return resp.json()
 
-@app.route("/api/v1/reservations", methods=["GET"])
-def get_reservations():
-    user_name = request.headers.get("X-User-Name")
-    if not user_name:
-        return jsonify({"error": "X-User-Name header is missing"}), 400
-
+def fetch_reservations(user_name):
     # Получаем все бронирования пользователя
-    reservations_resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}")
-    if reservations_resp.status_code != 200:
-        return jsonify({"error": "Failed to fetch reservations"}), 500
-
-    reservations_json = reservations_resp.json()
+    resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}", timeout=2)
+    resp.raise_for_status()
+    reservations_json = resp.json()
     result = []
 
     for reservation in reservations_json:
@@ -63,14 +87,14 @@ def get_reservations():
         # Получаем информацию о книге
         book_data = {}
         if book_uid and library_uid:
-            book_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/{book_uid}")
+            book_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}/{book_uid}", timeout=2)
             if book_resp.status_code == 200:
                 book_data = book_resp.json()
 
         # Получаем информацию о библиотеке
         library_data = {}
         if library_uid:
-            library_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}")
+            library_resp = requests.get(f"{LIBRARY_URL}/libraries/{library_uid}", timeout=2)
             if library_resp.status_code == 200:
                 library_data = library_resp.json()
 
@@ -93,7 +117,48 @@ def get_reservations():
             }
         })
 
-    return jsonify(result), 200
+    return result
+
+# -------------------- Получение библиотек --------------------
+@app.route("/api/v1/libraries", methods=["GET"])
+def get_libraries():
+    city = request.args.get("city", "Москва")
+    page = request.args.get("page", 1)
+    size = request.args.get("size", 1)
+
+    data = library_cb.call(fetch_libraries, city, page, size)
+    return jsonify(data), 200 if "message" not in data else 503
+
+# -------------------- Получение книг --------------------
+@app.route("/api/v1/libraries/<library_uid>/books", methods=["GET"])
+def get_books(library_uid):
+    page = request.args.get("page", 1)
+    size = request.args.get("size", 1)
+    show_all = request.args.get("showAll", "false").lower() == "true"
+
+    data = library_cb.call(fetch_books, library_uid, page, size, show_all)
+    return jsonify(data), 200 if "message" not in data else 503
+
+
+# -------------------- Получение рейтинга --------------------
+@app.route("/api/v1/rating", methods=["GET"])
+def get_rating():
+    user_name = request.headers.get("X-User-Name")
+    if not user_name:
+        return jsonify({"error": "X-User-Name header is missing"}), 400
+
+    data = rating_cb.call(fetch_rating, user_name)
+    return jsonify(data), 200 if "message" not in data else 503
+
+@app.route("/api/v1/reservations", methods=["GET"])
+def get_reservations():
+    user_name = request.headers.get("X-User-Name")
+    if not user_name:
+        return jsonify({"error": "X-User-Name header is missing"}), 400
+
+    data = reservation_cb.call(fetch_reservations, user_name)
+    return jsonify(data), 200 if "message" not in data else 503
+
 
 # -------------------- Создание бронирования --------------------
 @app.route("/api/v1/reservations", methods=["POST"])
