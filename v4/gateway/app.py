@@ -38,7 +38,7 @@ class CircuitBreaker:
         return result
 
     def fallback(self, *args, **kwargs):
-        return {"message": "Service temporarily unavailable (fallback)"}
+        return {"message": "Bonus Service unavailable"}
     
 library_cb = CircuitBreaker(failure_threshold=3, retry_timeout=10)
 rating_cb = CircuitBreaker(failure_threshold=3, retry_timeout=10)
@@ -164,6 +164,9 @@ def get_reservations():
 @app.route("/api/v1/reservations", methods=["POST"])
 def create_reservation():
     user_name = request.headers.get("X-User-Name")
+    if not user_name:
+        return jsonify({"error": "X-User-Name header is missing"}), 400
+
     data = request.get_json()
     book_uid = data.get("bookUid")
     library_uid = data.get("libraryUid")
@@ -173,8 +176,13 @@ def create_reservation():
     rented_resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}/count")
     rented_count = rented_resp.json().get("rentedCount", 0) if rented_resp.status_code == 200 else 0
 
-    rating_resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name})
-    stars = rating_resp.json().get("stars", 1) if rating_resp.status_code == 200 else 1
+    # Получаем рейтинг пользователя через Circuit Breaker
+    try:
+        stars_resp = rating_cb.call(fetch_rating, user_name)
+        stars = stars_resp.get("stars", 1)
+    except Exception:
+        # Если rating_service упал, даём дефолтное значение
+        stars = 1
 
     if rented_count >= stars:
         return jsonify({"message": "Maximum number of rented books reached"}), 400
@@ -188,11 +196,20 @@ def create_reservation():
     # Создаём запись в Reservation Service
     payload = {"bookUid": book_uid, "libraryUid": library_uid, "tillDate": till_date}
     headers = {"X-User-Name": user_name, "Content-Type": "application/json"}
-    res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers)
-    reservation_json = res.json()
 
-    # Уменьшаем доступные книги
-    requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement")
+    try:
+        res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers, timeout=3)
+        res.raise_for_status()
+        reservation_json = res.json()
+    except requests.RequestException:
+        # Если Reservation Service недоступен, возвращаем fallback
+        return jsonify({"message": "Reservation Service unavailable"}), 503
+
+    # Уменьшаем доступные книги (не критично для failover)
+    try:
+        requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement", timeout=2)
+    except:
+        pass  # игнорируем ошибки тут
 
     response = {
         "reservationUid": reservation_json.get("reservationUid"),
