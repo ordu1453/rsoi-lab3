@@ -15,6 +15,58 @@ services:
       - "5432:5432"
 
 # TODO добавить сервисы
+  gateway:
+    build: ./v4/gateway
+    container_name: gateway_service
+    restart: on-failure
+    environment:
+      # DATABASE_URL: postgresql://program:test@postgres:5432/gateway
+      FLASK_APP: app.py
+      FLASK_ENV: development
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+
+  rating:
+    build: ./v4/rating
+    container_name: rating_service
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql://program:test@postgres:5432/ratings
+      FLASK_APP: app.py
+      FLASK_ENV: development
+    ports:
+      - "8050:8050"
+    depends_on:
+      - postgres
+
+  library:
+    build: ./v4/library  
+    container_name: library_service
+    restart: on-failure
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://program:test@postgres:5432/libraries
+      FLASK_APP: app.py
+      FLASK_ENV: development
+    ports:
+      - "8060:8060"
+
+  reservation:
+    build: ./v4/reservation 
+    container_name: reservation_service
+    restart: on-failure
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://program:test@postgres:5432/reservations
+      FLASK_APP: app.py
+      FLASK_ENV: development
+    ports:
+      - "8070:8070"
 
 volumes:
   db-data:
