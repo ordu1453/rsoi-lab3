@@ -63,20 +63,32 @@ def rating_queue_worker():
             continue
 
         user_name = task["user_name"]
-        stars = task["stars"]
+        delta = task["delta"]
 
         try:
-            resp = requests.post(
+            # 1. Получаем ТЕКУЩИЙ рейтинг
+            resp = requests.get(
                 f"{RATING_URL}/rating",
-                json={"username": user_name, "stars": stars},
+                headers={"X-User-Name": user_name},
                 timeout=2
             )
             resp.raise_for_status()
-            print(f"[QUEUE] Rating updated for {user_name}")
+            current = resp.json().get("stars", 1)
+
+            # 2. Применяем операцию
+            new_stars = current + delta
+
+            # 3. Обновляем рейтинг
+            requests.post(
+                f"{RATING_URL}/rating",
+                json={"username": user_name, "stars": new_stars},
+                timeout=2
+            )
+
             rating_queue.task_done()
+
         except Exception:
-            # сервис всё ещё недоступен → кладём обратно
-            print(f"[QUEUE] Rating service unavailable, retry later")
+            # сервис всё ещё недоступен
             rating_queue.put(task)
             rating_queue.task_done()
             time.sleep(3)
@@ -310,20 +322,13 @@ def return_book(reservation_uid):
         stars_count = None
 
     if stars_count is not None:
-        new_stars = stars_count + 1
-
         try:
-            requests.post(
-                f"{RATING_URL}/rating",
-                json={"username": user_name, "stars": new_stars},
-                timeout=2
-            )
-        except Exception:
-            # Сервис недоступен → кладём в очередь
-            rating_queue.put({
-                "user_name": user_name,
-                "stars": new_stars + 1
-            })
+            requests.post(...)
+        except:
+            rating_queue.put({"user_name": user_name, "delta": 1})
+    else:
+        # rating недоступен → ВСЁ РАВНО кладём операцию
+        rating_queue.put({"user_name": user_name, "delta": 1})
 
     return "", 204
 
