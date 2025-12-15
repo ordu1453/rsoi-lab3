@@ -322,7 +322,7 @@ def return_book(reservation_uid):
             # Сервис недоступен → кладём в очередь
             rating_queue.put({
                 "user_name": user_name,
-                "stars": new_stars
+                "stars": new_stars + 1
             })
 
     return "", 204
