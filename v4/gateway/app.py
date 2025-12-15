@@ -241,50 +241,45 @@ def return_book(reservation_uid):
     returned_date = datetime.strptime(returned_date_str, "%Y-%m-%d").date()
 
     headers = {"X-User-Name": user_name}
-    resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers)
 
-    if resp.status_code == 404:
-        return jsonify({"message": "Reservation not found"}), 404
-    elif resp.status_code != 200:
-        return jsonify({"message": "Failed to fetch reservation"}), resp.status_code
-
-    reservation = resp.json()
-
+    # Получаем reservation
+    try:
+        resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers)
+        resp.raise_for_status()
+        reservation = resp.json()
+    except requests.RequestException:
+        return jsonify({"message": "Reservation Service unavailable"}), 503
 
     till_date = datetime.strptime(reservation["tillDate"], "%Y-%m-%d").date()
-    # original_condition = reservation["bookUid"].get("condition", "EXCELLENT")
-
-    # Определяем новый статус
     status = "RETURNED"
     if returned_date > till_date:
         status = "EXPIRED"
 
     # Обновляем Reservation Service
-    payload = {"condition": returned_condition, "date": returned_date_str}
-    requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", json=payload, headers=headers)
+    try:
+        requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return",
+                      json={"condition": returned_condition, "date": returned_date_str},
+                      headers=headers)
+    except:
+        pass  # ошибки Reservation Service можно игнорировать здесь
 
-    # # Обновляем Library Service
-    # book_uid = reservation["book"]["bookUid"]
-    # library_uid = reservation["library"]["libraryUid"]
-    # requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/increase")
+    # Обновляем рейтинг через Circuit Breaker
+    try:
+        stars_resp = rating_cb.call(fetch_rating, user_name)
+        if "message" in stars_resp:
+            # rating_service недоступен → пропускаем обновление рейтинга
+            stars_count = None
+        else:
+            stars_count = stars_resp.get("stars", 1)
+    except:
+        stars_count = None
 
-    # Обновляем рейтинг
-    penalty = 0
-    if status == "EXPIRED":
-        penalty += 10
-    # if returned_condition != original_condition:
-    #     penalty += 10
-
-
-    headersss = {"X-User-Name":user_name}
-    rating_req = requests.get(f"{RATING_URL}/rating", headers=headersss)
-    stars = rating_req.json()
-    stars_count = stars.get("stars")
-
-    if penalty > 0:
-        requests.post(f"{RATING_URL}/rating", json={"username":user_name,"stars": stars_count+1})
-    else:
-        requests.post(f"{RATING_URL}/rating", json={"username":user_name,"stars":  stars_count+1})
+    if stars_count is not None:
+        new_stars = stars_count + 1
+        try:
+            requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": new_stars})
+        except:
+            pass  # если сервис недоступен, просто пропускаем
 
     return "", 204
 
