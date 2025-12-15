@@ -38,7 +38,7 @@ jobs:
         run: ./scripts/test-script.sh
         env:
           VARIANT: v4
-          SERVICE_NAME: rating_service
+          SERVICE_NAME: ratings
           PORT_NUMBER: 8060
 
 
