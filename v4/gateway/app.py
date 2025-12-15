@@ -14,7 +14,7 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.retry_timeout = retry_timeout
         self.failure_count = 0
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.state = "CLOSED" 
         self.last_failure_time = None
         self.lock = Lock()
 
@@ -36,7 +36,6 @@ class CircuitBreaker:
                     self.state = "OPEN"
             return self.fallback(*args, **kwargs)
 
-        # Успешный ответ → сброс
         with self.lock:
             self.failure_count = 0
             self.state = "CLOSED"
@@ -226,7 +225,6 @@ def create_reservation():
     # Получаем рейтинг пользователя через Circuit Breaker
     stars_resp = rating_cb.call(fetch_rating, user_name)
     if "message" in stars_resp:
-        # fallback сработал → зависимый сервис недоступен
         return jsonify(stars_resp), 503
 
     stars = stars_resp.get("stars", 1)
@@ -251,7 +249,6 @@ def create_reservation():
     except requests.RequestException:
         return jsonify({"message": "Reservation Service unavailable"}), 503
 
-    # Уменьшаем доступные книги
     try:
         requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement", timeout=2)
     except:
@@ -278,7 +275,8 @@ def create_reservation():
     }
 
     return jsonify(response), 200
-# -------------------- Возврат книги --------------------
+
+
 @app.route("/api/v1/reservations/<reservation_uid>/return", methods=["POST"])
 def return_book(reservation_uid):
     user_name = request.headers.get("X-User-Name")
@@ -308,13 +306,13 @@ def return_book(reservation_uid):
                       json={"condition": returned_condition, "date": returned_date_str},
                       headers=headers)
     except:
-        pass  # ошибки Reservation Service можно игнорировать здесь
-
+        pass 
+    
     # Обновляем рейтинг через Circuit Breaker
     try:
         stars_resp = rating_cb.call(fetch_rating, user_name)
         if "message" in stars_resp:
-            # rating_service недоступен → пропускаем обновление рейтинга
+            # rating_service недоступен - пропускаем обновление рейтинга
             stars_count = None
         else:
             stars_count = stars_resp.get("stars", 1)
@@ -327,7 +325,6 @@ def return_book(reservation_uid):
         except:
             rating_queue.put({"user_name": user_name, "delta": 1})
     else:
-        # rating недоступен → ВСЁ РАВНО кладём операцию
         rating_queue.put({"user_name": user_name, "delta": 1})
 
     return "", 204
