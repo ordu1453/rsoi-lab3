@@ -2,7 +2,11 @@ from flask import Flask, jsonify, request
 import requests
 from datetime import datetime
 import time
-from threading import Lock
+from threading import Lock, Thread
+from queue import Queue, Empty
+
+rating_queue = Queue()
+
 
 
 class CircuitBreaker:
@@ -50,6 +54,36 @@ app = Flask(__name__)
 LIBRARY_URL = "http://library_service:8060"
 RATING_URL = "http://rating_service:8050"
 RESERVATION_URL = "http://reservation_service:8070"
+
+def rating_queue_worker():
+    while True:
+        try:
+            task = rating_queue.get(timeout=5)
+        except Empty:
+            continue
+
+        user_name = task["user_name"]
+        stars = task["stars"]
+
+        try:
+            resp = requests.post(
+                f"{RATING_URL}/rating",
+                json={"username": user_name, "stars": stars},
+                timeout=2
+            )
+            resp.raise_for_status()
+            print(f"[QUEUE] Rating updated for {user_name}")
+            rating_queue.task_done()
+        except Exception:
+            # сервис всё ещё недоступен → кладём обратно
+            print(f"[QUEUE] Rating service unavailable, retry later")
+            rating_queue.put(task)
+            rating_queue.task_done()
+            time.sleep(3)
+
+
+Thread(target=rating_queue_worker, daemon=True).start()
+
 
 # -------------------- Вспомогательные функции для запросов --------------------
 def fetch_libraries(city, page, size):
@@ -277,10 +311,19 @@ def return_book(reservation_uid):
 
     if stars_count is not None:
         new_stars = stars_count + 1
+
         try:
-            requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": new_stars})
-        except:
-            pass  # если сервис недоступен, просто пропускаем
+            requests.post(
+                f"{RATING_URL}/rating",
+                json={"username": user_name, "stars": new_stars},
+                timeout=2
+            )
+        except Exception:
+            # Сервис недоступен → кладём в очередь
+            rating_queue.put({
+                "user_name": user_name,
+                "stars": new_stars
+            })
 
     return "", 204
 
