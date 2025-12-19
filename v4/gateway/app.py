@@ -251,8 +251,12 @@ def create_reservation():
         current_stars = resp.json().get("stars", 1)
         requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": current_stars + 1})
     except requests.RequestException:
-        # если сервис недоступен — добавляем в очередь
-        enqueue_rating_update(user_name, 1)
+        return jsonify({"message": "Reservation Service unavailable"}), 503
+
+    try:
+        requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement", timeout=2)
+    except:
+        pass
 
     response = {
         "reservationUid": reservation_json.get("reservationUid"),
