@@ -6,64 +6,10 @@ from datetime import datetime
 import threading
 import time
 from threading import Lock, Thread
-from queue import Queue
+from queue import Queue, Empty
 
-# Очередь для отложенного обновления рейтинга
 rating_queue = Queue()
 
-def process_rating_queue():
-    while True:
-        try:
-            username, increment = rating_queue.get()
-            try:
-                resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": username}, timeout=2)
-                if resp.status_code == 200:
-                    current_stars = resp.json().get("stars", 1)
-                    requests.post(f"{RATING_URL}/rating", json={"username": username, "stars": current_stars + increment})
-                else:
-                    # Если не удалось, возвращаем в очередь
-                    rating_queue.put((username, increment))
-            except requests.RequestException:
-                rating_queue.put((username, increment))
-        except Exception:
-            pass
-        time.sleep(1)  # небольшой интервал между попытками
-
-# Запускаем поток для обработки очереди
-Thread(target=process_rating_queue, daemon=True).start()
-
-def enqueue_rating_update(username, increment):
-    rating_queue.put((username, increment))
-
-# ----------------- Redis -----------------
-r = redis.Redis(host='redis', port=6379, db=0) 
-
-def enqueue_rating_update(user_name, increment):
-    """Добавляем обновление рейтинга в очередь Redis"""
-    r.rpush("rating_queue", json.dumps({"user": user_name, "increment": increment}))
-
-def process_rating_queue():
-    """Фоновый процесс для обработки очереди рейтинга"""
-    while True:
-        item = r.lpop("rating_queue")
-        if not item:
-            time.sleep(1)
-            continue
-        data = json.loads(item)
-        user_name = data["user"]
-        increment = data["increment"]
-        try:
-            resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
-            resp.raise_for_status()
-            current_stars = resp.json().get("stars", 1)
-            requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": current_stars + increment})
-        except requests.RequestException:
-            # если сервис недоступен — возвращаем задачу обратно в очередь
-            r.rpush("rating_queue", item)
-            time.sleep(2)
-
-# Запускаем фоновый поток для обработки очереди
-threading.Thread(target=process_rating_queue, daemon=True).start()
 
 
 class CircuitBreaker:
@@ -71,7 +17,7 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.retry_timeout = retry_timeout
         self.failure_count = 0
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.state = "CLOSED" 
         self.last_failure_time = None
         self.lock = Lock()
 
@@ -93,7 +39,6 @@ class CircuitBreaker:
                     self.state = "OPEN"
             return self.fallback(*args, **kwargs)
 
-        # Успешный ответ → сброс
         with self.lock:
             self.failure_count = 0
             self.state = "CLOSED"
@@ -111,6 +56,48 @@ app = Flask(__name__)
 LIBRARY_URL = "http://library_service:8060"
 RATING_URL = "http://rating_service:8050"
 RESERVATION_URL = "http://reservation_service:8070"
+
+def rating_queue_worker():
+    while True:
+        try:
+            task = rating_queue.get(timeout=5)
+        except Empty:
+            continue
+
+        user_name = task["user_name"]
+        delta = task["delta"]
+
+        try:
+            # 1. Получаем ТЕКУЩИЙ рейтинг
+            resp = requests.get(
+                f"{RATING_URL}/rating",
+                headers={"X-User-Name": user_name},
+                timeout=2
+            )
+            resp.raise_for_status()
+            current = resp.json().get("stars", 1)
+
+            # 2. Применяем операцию
+            new_stars = current + delta
+
+            # 3. Обновляем рейтинг
+            requests.post(
+                f"{RATING_URL}/rating",
+                json={"username": user_name, "stars": new_stars},
+                timeout=2
+            )
+
+            rating_queue.task_done()
+
+        except Exception:
+            # сервис всё ещё недоступен
+            rating_queue.put(task)
+            rating_queue.task_done()
+            time.sleep(3)
+
+
+Thread(target=rating_queue_worker, daemon=True).start()
+
 
 # -------------------- Вспомогательные функции для запросов --------------------
 def fetch_libraries(city, page, size):
@@ -235,13 +222,12 @@ def create_reservation():
     rented_resp = requests.get(f"{RESERVATION_URL}/reservations/{user_name}/count")
     rented_count = rented_resp.json().get("rentedCount", 0) if rented_resp.status_code == 200 else 0
 
-    # Получаем текущий рейтинг через Circuit Breaker
-    try:
-        rating_resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
-        rating_resp.raise_for_status()
-        stars = rating_resp.json().get("stars", 1)
-    except requests.RequestException:
-        stars = 1  # fallback если сервис недоступен
+    # Получаем рейтинг пользователя через Circuit Breaker
+    stars_resp = rating_cb.call(fetch_rating, user_name)
+    if "message" in stars_resp:
+        return jsonify(stars_resp), 503
+
+    stars = stars_resp.get("stars", 1)
 
     if rented_count >= stars:
         return jsonify({"message": "Maximum number of rented books reached"}), 400
@@ -258,10 +244,6 @@ def create_reservation():
     res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers)
     reservation_json = res.json()
 
-    # Уменьшаем доступные книги
-    requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement")
-
-    # Обновляем рейтинг пользователя
     try:
         # Если сервис доступен — обновляем сразу
         resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
@@ -293,7 +275,8 @@ def create_reservation():
     }
 
     return jsonify(response), 200
-# -------------------- Возврат книги --------------------
+
+
 @app.route("/api/v1/reservations/<reservation_uid>/return", methods=["POST"])
 def return_book(reservation_uid):
     user_name = request.headers.get("X-User-Name")
@@ -321,18 +304,31 @@ def return_book(reservation_uid):
         penalty += 1  # штраф за просрочку
 
     # Обновляем Reservation Service
-    payload = {"condition": returned_condition, "date": returned_date_str}
-    requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", json=payload, headers=headers)
-
-    # Обновляем рейтинг
-    total_increment = 1 + penalty  # всегда +1 за возврат + штраф, если просрочка
     try:
-        resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
-        resp.raise_for_status()
-        current_stars = resp.json().get("stars", 1)
-        requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": current_stars + total_increment})
-    except requests.RequestException:
-        enqueue_rating_update(user_name, total_increment)
+        requests.post(f"{RESERVATION_URL}/reservations/{reservation_uid}/return",
+                      json={"condition": returned_condition, "date": returned_date_str},
+                      headers=headers)
+    except:
+        pass 
+    
+    # Обновляем рейтинг через Circuit Breaker
+    try:
+        stars_resp = rating_cb.call(fetch_rating, user_name)
+        if "message" in stars_resp:
+            # rating_service недоступен - пропускаем обновление рейтинга
+            stars_count = None
+        else:
+            stars_count = stars_resp.get("stars", 1)
+    except:
+        stars_count = None
+
+    if stars_count is not None:
+        try:
+            requests.post(...)
+        except:
+            rating_queue.put({"user_name": user_name, "delta": 1})
+    else:
+        rating_queue.put({"user_name": user_name, "delta": 1})
 
     return "", 204
 
