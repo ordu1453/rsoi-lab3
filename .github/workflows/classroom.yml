@@ -5,6 +5,7 @@ on:
       - master
       - deve
       - dev
+      - new_main
   pull_request:
     branches:
       - master
