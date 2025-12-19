@@ -1,6 +1,9 @@
-from flask import Flask, jsonify, request
+import redis
+import json
 import requests
+from flask import Flask, jsonify, request
 from datetime import datetime
+import threading
 import time
 from threading import Lock, Thread
 from queue import Queue, Empty
@@ -210,9 +213,6 @@ def get_reservations():
 @app.route("/api/v1/reservations", methods=["POST"])
 def create_reservation():
     user_name = request.headers.get("X-User-Name")
-    if not user_name:
-        return jsonify({"error": "X-User-Name header is missing"}), 400
-
     data = request.get_json()
     book_uid = data.get("bookUid")
     library_uid = data.get("libraryUid")
@@ -241,18 +241,18 @@ def create_reservation():
     # Создаём запись в Reservation Service
     payload = {"bookUid": book_uid, "libraryUid": library_uid, "tillDate": till_date}
     headers = {"X-User-Name": user_name, "Content-Type": "application/json"}
+    res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers)
+    reservation_json = res.json()
 
     try:
-        res = requests.post(f"{RESERVATION_URL}/reservations", json=payload, headers=headers, timeout=3)
-        res.raise_for_status()
-        reservation_json = res.json()
+        # Если сервис доступен — обновляем сразу
+        resp = requests.get(f"{RATING_URL}/rating", headers={"X-User-Name": user_name}, timeout=2)
+        resp.raise_for_status()
+        current_stars = resp.json().get("stars", 1)
+        requests.post(f"{RATING_URL}/rating", json={"username": user_name, "stars": current_stars + 1})
     except requests.RequestException:
-        return jsonify({"message": "Reservation Service unavailable"}), 503
-
-    try:
-        requests.patch(f"{LIBRARY_URL}/libraries/{library_uid}/books/{book_uid}/decrement", timeout=2)
-    except:
-        pass
+        # если сервис недоступен — добавляем в очередь
+        enqueue_rating_update(user_name, 1)
 
     response = {
         "reservationUid": reservation_json.get("reservationUid"),
@@ -286,19 +286,22 @@ def return_book(reservation_uid):
     returned_date = datetime.strptime(returned_date_str, "%Y-%m-%d").date()
 
     headers = {"X-User-Name": user_name}
+    resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers)
 
-    # Получаем reservation
-    try:
-        resp = requests.get(f"{RESERVATION_URL}/reservations/{reservation_uid}/return", headers=headers)
-        resp.raise_for_status()
-        reservation = resp.json()
-    except requests.RequestException:
-        return jsonify({"message": "Reservation Service unavailable"}), 503
+    if resp.status_code == 404:
+        return jsonify({"message": "Reservation not found"}), 404
+    elif resp.status_code != 200:
+        return jsonify({"message": "Failed to fetch reservation"}), resp.status_code
 
+    reservation = resp.json()
     till_date = datetime.strptime(reservation["tillDate"], "%Y-%m-%d").date()
+
+    # Определяем новый статус
     status = "RETURNED"
+    penalty = 0
     if returned_date > till_date:
         status = "EXPIRED"
+        penalty += 1  # штраф за просрочку
 
     # Обновляем Reservation Service
     try:

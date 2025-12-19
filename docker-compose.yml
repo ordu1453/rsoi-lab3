@@ -15,6 +15,15 @@ services:
       - "5432:5432"
 
 # TODO добавить сервисы
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
   gateway:
     build: ./v4/gateway
     container_name: gateway_service
