@@ -4,13 +4,10 @@ on:
     branches:
       - master
       - deve
-      - dev
-      - new_main
   pull_request:
     branches:
       - master
       - deve
-      - dev
 jobs:
   build:
     name: Autograding
