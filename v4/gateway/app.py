@@ -8,6 +8,8 @@ from queue import Queue, Empty
 rating_queue = Queue()
 
 
+#
+
 
 class CircuitBreaker:
     def __init__(self, failure_threshold=3, retry_timeout=10):
